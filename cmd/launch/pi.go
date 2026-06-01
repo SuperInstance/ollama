@@ -90,7 +90,7 @@ func ensurePiInstalled() (string, error) {
 }
 
 func ensurePiWebSearchPackage(bin string) {
-	if !shouldManagePiWebSearch() {
+	if !shouldManageOllamaWebSearch() {
 		fmt.Fprintf(os.Stderr, "%sCloud is disabled; skipping %s setup.%s\n", ansiGray, piWebSearchPkg, ansiReset)
 		return
 	}
@@ -129,7 +129,7 @@ func ensurePiWebSearchPackage(bin string) {
 	fmt.Fprintf(os.Stderr, "%s  ✓ Updated %s%s\n", ansiGreen, piWebSearchPkg, ansiReset)
 }
 
-func shouldManagePiWebSearch() bool {
+func shouldManageOllamaWebSearch() bool {
 	client, err := api.ClientFromEnvironment()
 	if err != nil {
 		return true
