@@ -63,6 +63,14 @@ func (r *Report) totalVRAM() (used, total float64) {
 	return
 }
 
+// estLabel returns " (estimated)" when the utilization was estimated.
+func estLabel(isEst bool) string {
+	if isEst {
+		return " (estimated)"
+	}
+	return ""
+}
+
 func (r *Report) writeFleetOverview(b *strings.Builder) {
 	used, total := r.totalVRAM()
 	pct := float64(0)
@@ -100,8 +108,8 @@ func (r *Report) writeModelDetails(b *strings.Builder) {
 			icon = "⚠️"
 		}
 		b.WriteString(fmt.Sprintf("  %s %s (%s)\n", icon, p.Model, p.Host))
-		b.WriteString(fmt.Sprintf("     VRAM: %.1fGB | Context: %d | Utilization: %.1f%%\n",
-			p.SizeGB, p.ContextLength, p.UtilizationPct))
+		b.WriteString(fmt.Sprintf("     VRAM: %.1fGB | Context: %d | Utilization: %.1f%%%s\n",
+			p.SizeGB, p.ContextLength, p.UtilizationPct, estLabel(p.UtilizationIsEst)))
 		b.WriteString(fmt.Sprintf("     Throughput: %s | Queue: %d | Requests: %d\n\n",
 			FormatTokensPerSec(p.AvgTokensPerSec), p.QueueDepth, p.TotalRequests))
 	}

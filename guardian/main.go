@@ -96,7 +96,7 @@ func runBudget(fleetDir, budgetFile string) {
 }
 
 func runWatch(fleetDir string, interval time.Duration) {
-	if err := RunWatch(fleetDir, interval); err != nil {
+	if err := RunWatchWithSignalHandling(fleetDir, interval); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

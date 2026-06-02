@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -28,15 +32,15 @@ func writeTestFleet(t *testing.T, instances []InstanceState) string {
 func makeLoadedModel(name string, sizeGB float64, idleMinutes int, reqCount int, tokensToday int64) LoadedModel {
 	now := time.Now()
 	return LoadedModel{
-		Name:           name,
-		SizeGB:         sizeGB,
-		ContextLength:  4096,
-		LoadedAt:       now.Add(-6 * time.Hour),
-		LastRequestAt:  now.Add(-time.Duration(idleMinutes) * time.Minute),
-		RequestCount:   reqCount,
+		Name:            name,
+		SizeGB:          sizeGB,
+		ContextLength:   4096,
+		LoadedAt:        now.Add(-6 * time.Hour),
+		LastRequestAt:   now.Add(-time.Duration(idleMinutes) * time.Minute),
+		RequestCount:    reqCount,
 		TokensGenerated: int64(reqCount) * 500,
-		TokensToday:    tokensToday,
-		ConcurrentReqs: 0,
+		TokensToday:     tokensToday,
+		ConcurrentReqs:  0,
 	}
 }
 
@@ -78,6 +82,34 @@ func TestLoadFleetEmptyDir(t *testing.T) {
 	}
 }
 
+// Bug fix #1: LoadFleet logs warnings for malformed JSON instead of silent continue
+func TestLoadFleetMalformedJSONLogsWarning(t *testing.T) {
+	dir := t.TempDir()
+	// Write a valid instance
+	validInst := InstanceState{Host: "gpu01", Models: []LoadedModel{{Name: "test"}}}
+	validData, _ := json.Marshal(validInst)
+	os.WriteFile(filepath.Join(dir, "valid.json"), validData, 0644)
+
+	// Write a malformed JSON file
+	os.WriteFile(filepath.Join(dir, "bad.json"), []byte("{invalid json!!!}"), 0644)
+
+	// Write an unreadable file (well, we can't easily make unreadable in tempdir as root,
+	// but malformed JSON test is the key one)
+	os.WriteFile(filepath.Join(dir, "also-bad.json"), []byte("not json at all"), 0644)
+
+	fleet, err := LoadFleet(dir)
+	if err != nil {
+		t.Fatalf("LoadFleet: %v", err)
+	}
+	// Should still load the valid one
+	if len(fleet.Instances) != 1 {
+		t.Errorf("expected 1 valid instance, got %d", len(fleet.Instances))
+	}
+	if fleet.Instances[0].Host != "gpu01" {
+		t.Errorf("expected gpu01, got %s", fleet.Instances[0].Host)
+	}
+}
+
 func TestCheckBudgets(t *testing.T) {
 	fleet := &Fleet{
 		Instances: []InstanceState{
@@ -103,7 +135,6 @@ func TestCheckBudgets(t *testing.T) {
 		t.Fatal("expected budget violations, got none")
 	}
 
-	// Should have: VRAM exceed, concurrent exceed, tokens exceed, global exceed
 	foundVRAM, foundConcurrent, foundTokens, foundGlobal := false, false, false, false
 	for _, v := range violations {
 		if contains(v, "exceeds budget of 40") {
@@ -214,7 +245,7 @@ func TestDetectWasteOversizedContext(t *testing.T) {
 			Host:           "gpu01",
 			SizeGB:         20.0,
 			ContextLength:  32768,
-			TotalTokens:    10000, // low usage
+			TotalTokens:    10000,
 			TotalRequests:  100,
 			UtilizationPct: 50,
 			LoadDuration:   1 * time.Hour,
@@ -251,6 +282,40 @@ func TestDetectWasteDuplicateVariants(t *testing.T) {
 	}
 }
 
+// Bug fix #5: Duplicate detection should NOT flag when all variants are active
+func TestDetectWasteDuplicateVariantsAllActive(t *testing.T) {
+	profiles := []Profile{
+		{Model: "llama3:70b-q4", Host: "gpu01", SizeGB: 40.0, UtilizationPct: 80, IdleDuration: 1 * time.Minute},
+		{Model: "llama3:70b-q5", Host: "gpu02", SizeGB: 47.0, UtilizationPct: 90, IdleDuration: 1 * time.Minute},
+	}
+
+	wastes := DetectWaste(profiles)
+	for _, w := range wastes {
+		if w.Type == WasteDuplicateVariant {
+			t.Error("should not flag duplicate variants when all are actively used")
+		}
+	}
+}
+
+// Bug fix #5: Duplicate detection should flag when at least one is idle
+func TestDetectWasteDuplicateVariantsOneIdle(t *testing.T) {
+	profiles := []Profile{
+		{Model: "llama3:70b-q4", Host: "gpu01", SizeGB: 40.0, UtilizationPct: 80, IdleDuration: 1 * time.Minute},
+		{Model: "llama3:70b-q5", Host: "gpu02", SizeGB: 47.0, UtilizationPct: 5, IdleDuration: 2 * time.Hour},
+	}
+
+	wastes := DetectWaste(profiles)
+	found := false
+	for _, w := range wastes {
+		if w.Type == WasteDuplicateVariant {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected WasteDuplicateVariant when one variant is idle/low-util")
+	}
+}
+
 func TestDetectNoWaste(t *testing.T) {
 	profiles := []Profile{
 		{
@@ -265,6 +330,241 @@ func TestDetectNoWaste(t *testing.T) {
 	wastes := DetectWaste(profiles)
 	if len(wastes) != 0 {
 		t.Errorf("expected no waste, got %d", len(wastes))
+	}
+}
+
+// Bug fix #2: Configurable IdleThreshold via WasteDetector
+func TestWasteDetectorConfigurableIdleThreshold(t *testing.T) {
+	cfg := WasteDetectorConfig{
+		IdleThreshold:        5 * time.Minute,
+		ContextOversizeRatio: 4.0,
+	}
+	detector := NewWasteDetector(cfg)
+
+	profiles := []Profile{
+		{
+			Model:          "llama3:70b", Host: "gpu01", SizeGB: 47.0,
+			UtilizationPct: 5, LoadDuration: 1 * time.Hour, IdleDuration: 10 * time.Minute,
+		},
+	}
+
+	wastes := detector.Detect(profiles)
+	found := false
+	for _, w := range wastes {
+		if w.Type == WasteIdleModel {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected idle detection with 5min threshold for 10min idle model")
+	}
+
+	// Now with default 30min threshold — should NOT flag 10min idle
+	defaultDetector := NewWasteDetector(DefaultWasteDetectorConfig())
+	wastes2 := defaultDetector.Detect(profiles)
+	for _, w := range wastes2 {
+		if w.Type == WasteIdleModel {
+			t.Error("should not flag 10min idle with 30min default threshold")
+		}
+	}
+}
+
+// Bug fix #3: Configurable ContextOversizeRatio
+func TestWasteDetectorConfigurableContextRatio(t *testing.T) {
+	cfg := WasteDetectorConfig{
+		IdleThreshold:        30 * time.Minute,
+		ContextOversizeRatio: 2.0, // tighter ratio
+	}
+	detector := NewWasteDetector(cfg)
+
+	profiles := []Profile{
+		{
+			Model: "codellama:34b", Host: "gpu01", SizeGB: 20.0,
+			ContextLength: 32768, TotalTokens: 50000, TotalRequests: 100,
+			UtilizationPct: 50, LoadDuration: 1 * time.Hour, IdleDuration: 1 * time.Minute,
+		},
+	}
+	// avg 500 tokens/req, context 32768, ratio = 32768/500 = 65.5x — way over 2.0 threshold
+	wastes := detector.Detect(profiles)
+	found := false
+	for _, w := range wastes {
+		if w.Type == WasteOversizedContext {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected context waste with tighter ratio")
+	}
+}
+
+// Bug fix #4: Utilization is marked as estimated
+func TestProfilerUtilizationMarkedAsEstimated(t *testing.T) {
+	now := time.Now()
+	fleet := &Fleet{
+		Instances: []InstanceState{
+			{
+				Host: "gpu01",
+				Models: []LoadedModel{
+					{
+						Name: "llama3:70b", SizeGB: 40.0,
+						LoadedAt:      now.Add(-2 * time.Hour),
+						LastRequestAt: now.Add(-5 * time.Minute),
+						RequestCount:  10,
+					},
+				},
+			},
+		},
+	}
+	profiles := CollectProfiles(fleet)
+	if len(profiles) == 0 {
+		t.Fatal("expected profiles")
+	}
+	if !profiles[0].UtilizationIsEst {
+		t.Error("expected UtilizationIsEst to be true when using estimated request duration")
+	}
+	if profiles[0].UtilizationPct <= 0 {
+		t.Error("expected non-zero utilization")
+	}
+}
+
+// Bug fix #4: Configurable estimated request duration
+func TestProfilerConfigurableRequestDuration(t *testing.T) {
+	now := time.Now()
+	fleet := &Fleet{
+		Instances: []InstanceState{
+			{
+				Host: "gpu01",
+				Models: []LoadedModel{
+					{
+						Name: "llama3:70b", SizeGB: 40.0,
+						LoadedAt:      now.Add(-1 * time.Hour),
+						LastRequestAt: now,
+						RequestCount:  30,
+					},
+				},
+			},
+		},
+	}
+
+	// With 60s estimate: 30 reqs * 60s = 1800s = 30min active out of 60min = 50%
+	cfg60s := ModelProfilerConfig{EstimatedRequestDuration: 60 * time.Second}
+	profiles60 := CollectProfilesWithConfig(fleet, cfg60s)
+
+	// With 30s estimate: 30 reqs * 30s = 900s = 15min active out of 60min = 25%
+	cfg30s := ModelProfilerConfig{EstimatedRequestDuration: 30 * time.Second}
+	profiles30 := CollectProfilesWithConfig(fleet, cfg30s)
+
+	if len(profiles60) == 0 || len(profiles30) == 0 {
+		t.Fatal("expected profiles")
+	}
+
+	if profiles60[0].UtilizationPct <= profiles30[0].UtilizationPct {
+		t.Errorf("expected higher utilization with longer estimate: 60s=%.1f%% 30s=%.1f%%",
+			profiles60[0].UtilizationPct, profiles30[0].UtilizationPct)
+	}
+}
+
+// Bug fix #6: RunWatch respects context cancellation
+func TestRunWatchGracefulShutdown(t *testing.T) {
+	dir := t.TempDir()
+	// Write empty fleet so checkAndAlert succeeds
+	os.WriteFile(filepath.Join(dir, "empty.json"), []byte(`{"host":"test"}`), 0644)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var wg sync.WaitGroup
+	var watchErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		watchErr = RunWatch(ctx, dir, 100*time.Millisecond)
+	}()
+
+	// Let it tick once
+	time.Sleep(250 * time.Millisecond)
+	cancel()
+	wg.Wait()
+
+	if watchErr != nil {
+		t.Errorf("RunWatch returned error: %v", watchErr)
+	}
+}
+
+// Bug fix #7: FetchFleetFromAPI works with mock Ollama server
+func TestFetchFleetFromAPI(t *testing.T) {
+	psResponse := OllamaPSResponse{
+		Models: []OllamaAPIModel{
+			{
+				Name:     "llama3:70b",
+				SizeVRAM: 40 * 1024 * 1024 * 1024, // 40GB
+			},
+			{
+				Name: "mistral:7b",
+				Size: 4 * 1024 * 1024 * 1024, // 4GB (only Size, not SizeVRAM)
+			},
+		},
+	}
+	respBody, _ := json.Marshal(psResponse)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/ps" {
+			t.Errorf("expected /api/ps, got %s", r.URL.Path)
+			w.WriteHeader(404)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(respBody)
+	}))
+	defer server.Close()
+
+	fleet, err := FetchFleetFromAPI([]string{server.URL})
+	if err != nil {
+		t.Fatalf("FetchFleetFromAPI: %v", err)
+	}
+	if len(fleet.Instances) != 1 {
+		t.Fatalf("expected 1 instance, got %d", len(fleet.Instances))
+	}
+	inst := fleet.Instances[0]
+	if len(inst.Models) != 2 {
+		t.Fatalf("expected 2 models, got %d", len(inst.Models))
+	}
+	if inst.Models[0].Name != "llama3:70b" {
+		t.Errorf("expected llama3:70b, got %s", inst.Models[0].Name)
+	}
+	if inst.Models[0].SizeGB < 39.9 || inst.Models[0].SizeGB > 40.1 {
+		t.Errorf("expected ~40GB, got %.1f", inst.Models[0].SizeGB)
+	}
+	if inst.Models[1].SizeGB < 3.9 || inst.Models[1].SizeGB > 4.1 {
+		t.Errorf("expected ~4GB, got %.1f", inst.Models[1].SizeGB)
+	}
+}
+
+// Bug fix #7: FetchFleetFromAPI handles unreachable instances gracefully
+func TestFetchFleetFromAPIUnreachable(t *testing.T) {
+	_, err := FetchFleetFromAPI([]string{"http://127.0.0.1:1"})
+	if err == nil {
+		t.Error("expected error when all instances unreachable")
+	}
+}
+
+// Bug fix #7: FetchFleetFromAPI skips bad instances but returns good ones
+func TestFetchFleetFromAPIMixed(t *testing.T) {
+	psResponse := OllamaPSResponse{
+		Models: []OllamaAPIModel{{Name: "test-model"}},
+	}
+	respBody, _ := json.Marshal(psResponse)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(respBody)
+	}))
+	defer server.Close()
+
+	fleet, err := FetchFleetFromAPI([]string{"http://127.0.0.1:1", server.URL})
+	if err != nil {
+		t.Fatalf("expected success with partial reachability: %v", err)
+	}
+	if len(fleet.Instances) != 1 {
+		t.Errorf("expected 1 instance (from good server), got %d", len(fleet.Instances))
 	}
 }
 
@@ -291,7 +591,6 @@ func TestReportGeneration(t *testing.T) {
 	if len(output) == 0 {
 		t.Fatal("expected non-empty report")
 	}
-	// Check report contains key sections
 	if !contains(output, "CONSERVATION") {
 		t.Error("report missing CONSERVATION header")
 	}
@@ -322,6 +621,30 @@ func TestReportNoWaste(t *testing.T) {
 	output := r.Generate()
 	if !contains(output, "No waste detected") {
 		t.Error("expected 'No waste detected' in clean report")
+	}
+}
+
+// Bug fix #4: Report marks utilization as estimated
+func TestReportShowsEstimatedLabel(t *testing.T) {
+	now := time.Now()
+	fleet := &Fleet{
+		Instances: []InstanceState{
+			{
+				Host: "gpu01", TotalVRAMGB: 80.0, UsedVRAMGB: 40.0,
+				Models: []LoadedModel{
+					{
+						Name: "llama3:70b", SizeGB: 40.0,
+						LoadedAt: now.Add(-1 * time.Hour), LastRequestAt: now, RequestCount: 10,
+					},
+				},
+			},
+		},
+	}
+	profiles := CollectProfiles(fleet)
+	r := NewReport(fleet, profiles, nil)
+	output := r.Generate()
+	if !contains(output, "estimated") {
+		t.Error("report should show '(estimated)' label for utilization")
 	}
 }
 

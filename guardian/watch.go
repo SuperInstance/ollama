@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
-// RunWatch continuously monitors for waste and alerts.
-func RunWatch(fleetDir string, interval time.Duration) error {
+// RunWatch continuously monitors for waste and alerts with graceful shutdown.
+func RunWatch(ctx context.Context, fleetDir string, interval time.Duration) error {
 	fmt.Printf("👁️  Guardian watching fleet at %s (interval: %s)\n", fleetDir, interval)
 	fmt.Println("Press Ctrl+C to stop.")
 
@@ -18,13 +21,24 @@ func RunWatch(fleetDir string, interval time.Duration) error {
 		fmt.Printf("Error: %v\n", err)
 	}
 
-	for range ticker.C {
-		if err := checkAndAlert(fleetDir); err != nil {
-			fmt.Printf("Error: %v\n", err)
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("\n🛑 Guardian shutting down gracefully.")
+			return nil
+		case <-ticker.C:
+			if err := checkAndAlert(fleetDir); err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
 		}
 	}
+}
 
-	return nil
+// RunWatchWithSignalHandling wraps RunWatch with OS signal handling for graceful shutdown.
+func RunWatchWithSignalHandling(fleetDir string, interval time.Duration) error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return RunWatch(ctx, fleetDir, interval)
 }
 
 func checkAndAlert(fleetDir string) error {

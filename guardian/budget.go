@@ -3,16 +3,17 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"time"
 )
 
 // ModelBudget defines resource limits for a single model.
 type ModelBudget struct {
-	Model              string  `json:"model"`
-	MaxVRAMGB          float64 `json:"max_vram_gb"`
-	MaxConcurrentReqs  int     `json:"max_concurrent_requests"`
-	MaxTokensPerDay    int64   `json:"max_tokens_per_day"`
+	Model              string   `json:"model"`
+	MaxVRAMGB          float64  `json:"max_vram_gb"`
+	MaxConcurrentReqs  int      `json:"max_concurrent_requests"`
+	MaxTokensPerDay    int64    `json:"max_tokens_per_day"`
 	AllowedInstances   []string `json:"allowed_instances,omitempty"` // restrict to specific hosts
 }
 
@@ -51,6 +52,7 @@ type Fleet struct {
 }
 
 // LoadFleet reads fleet state from a directory of JSON files.
+// Logs warnings for files that cannot be read or parsed instead of silently skipping.
 func LoadFleet(dir string) (*Fleet, error) {
 	fleet := &Fleet{SampledAt: time.Now()}
 	entries, err := os.ReadDir(dir)
@@ -65,10 +67,12 @@ func LoadFleet(dir string) (*Fleet, error) {
 		path := dir + "/" + e.Name()
 		data, err := os.ReadFile(path)
 		if err != nil {
+			log.Printf("warning: failed to read fleet file %s: %v", path, err)
 			continue
 		}
 		var inst InstanceState
 		if err := json.Unmarshal(data, &inst); err != nil {
+			log.Printf("warning: malformed JSON in fleet file %s: %v", path, err)
 			continue
 		}
 		fleet.Instances = append(fleet.Instances, inst)

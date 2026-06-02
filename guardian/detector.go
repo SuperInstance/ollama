@@ -33,14 +33,44 @@ func (w Waste) String() string {
 		w.Severity, w.Model, w.Host, w.Detail, w.SavingsGB)
 }
 
-// IdleThreshold is how long a model can be idle before it's flagged.
-const IdleThreshold = 30 * time.Minute
+// WasteDetectorConfig holds configuration for waste detection thresholds.
+type WasteDetectorConfig struct {
+	IdleThreshold        time.Duration // How long before a model is considered idle (default 30m)
+	ContextOversizeRatio float64       // Ratio of context to actual usage that triggers a flag (default 4.0)
+}
 
-// ContextOversizeRatio flags when context is more than this ratio of actual usage.
-const ContextOversizeRatio = 4.0
+// DefaultWasteDetectorConfig returns sensible defaults.
+func DefaultWasteDetectorConfig() WasteDetectorConfig {
+	return WasteDetectorConfig{
+		IdleThreshold:        30 * time.Minute,
+		ContextOversizeRatio: 4.0,
+	}
+}
 
-// DetectWaste scans profiles for resource waste.
+// WasteDetector scans profiles for resource waste.
+type WasteDetector struct {
+	Config WasteDetectorConfig
+}
+
+// NewWasteDetector creates a detector with the given config (or defaults if zero).
+func NewWasteDetector(cfg WasteDetectorConfig) *WasteDetector {
+	if cfg.IdleThreshold <= 0 {
+		cfg.IdleThreshold = 30 * time.Minute
+	}
+	if cfg.ContextOversizeRatio <= 0 {
+		cfg.ContextOversizeRatio = 4.0
+	}
+	return &WasteDetector{Config: cfg}
+}
+
+// DetectWaste scans profiles for resource waste using default config.
+// Kept for backward compatibility.
 func DetectWaste(profiles []Profile) []Waste {
+	return NewWasteDetector(DefaultWasteDetectorConfig()).Detect(profiles)
+}
+
+// Detect scans profiles for resource waste using the detector's configuration.
+func (wd *WasteDetector) Detect(profiles []Profile) []Waste {
 	var wastes []Waste
 
 	modelInstances := make(map[string][]Profile) // group by model name
@@ -50,7 +80,7 @@ func DetectWaste(profiles []Profile) []Waste {
 
 	for _, p := range profiles {
 		// Check 1: Idle model
-		if p.IdleDuration > IdleThreshold && p.UtilizationPct < 10 {
+		if p.IdleDuration > wd.Config.IdleThreshold && p.UtilizationPct < 10 {
 			severity := "medium"
 			savings := p.SizeGB
 			if p.UtilizationPct < 2 {
@@ -70,7 +100,7 @@ func DetectWaste(profiles []Profile) []Waste {
 		// Check 2: Oversized context window
 		if p.ContextLength > 0 && p.TotalTokens > 0 && p.TotalRequests > 0 {
 			avgTokensPerReq := p.TotalTokens / int64(p.TotalRequests)
-			if float64(p.ContextLength) > float64(avgTokensPerReq)*ContextOversizeRatio && avgTokensPerReq > 0 {
+			if float64(p.ContextLength) > float64(avgTokensPerReq)*wd.Config.ContextOversizeRatio && avgTokensPerReq > 0 {
 				// Estimate wasted context VRAM (rough: 1GB per 8K context for a 7B model)
 				wastedRatio := 1.0 - float64(avgTokensPerReq)/float64(p.ContextLength)
 				wastedGB := p.SizeGB * wastedRatio * 0.3 // ~30% of model VRAM is context
@@ -90,7 +120,7 @@ func DetectWaste(profiles []Profile) []Waste {
 	}
 
 	// Check 3: Duplicate model variants across instances
-	// Regroup all profiles by their base model (stripping quantization)
+	// Only recommend consolidation if at least one variant is idle or low-utilization.
 	baseGroups := make(map[string][]Profile)
 	for _, p := range profiles {
 		base := stripQuant(p.Model)
@@ -100,25 +130,33 @@ func DetectWaste(profiles []Profile) []Waste {
 		if len(instances) <= 1 {
 			continue
 		}
-		duplicates := instances
-		if len(duplicates) > 1 {
-			var totalGB float64
-			var hosts []string
-			for _, d := range duplicates {
-				totalGB += d.SizeGB
-				hosts = append(hosts, d.Host)
+		// Check if at least one variant is idle or low-utilization
+		hasIdleOrLow := false
+		for _, inst := range instances {
+			if inst.UtilizationPct < 20 || inst.IdleDuration > wd.Config.IdleThreshold {
+				hasIdleOrLow = true
+				break
 			}
-			// Keep the most-used one, flag the rest
-			wastes = append(wastes, Waste{
-				Type:      WasteDuplicateVariant,
-				Model:     base,
-				Host:      strings.Join(hosts, ", "),
-				Detail:    fmt.Sprintf("%d variants of %s loaded across fleet (%.1fGB total). Consolidate to most-used variant.", len(duplicates), base, totalGB),
-				VRAMGB:    totalGB,
-				SavingsGB: totalGB / float64(len(duplicates)) * float64(len(duplicates)-1), // save all but one
-				Severity:  "medium",
-			})
 		}
+		if !hasIdleOrLow {
+			continue
+		}
+
+		var totalGB float64
+		var hosts []string
+		for _, d := range instances {
+			totalGB += d.SizeGB
+			hosts = append(hosts, d.Host)
+		}
+		wastes = append(wastes, Waste{
+			Type:      WasteDuplicateVariant,
+			Model:     base,
+			Host:      strings.Join(hosts, ", "),
+			Detail:    fmt.Sprintf("%d variants of %s loaded across fleet (%.1fGB total). At least one is idle/low-utilization — consolidate to most-used variant.", len(instances), base, totalGB),
+			VRAMGB:    totalGB,
+			SavingsGB: totalGB / float64(len(instances)) * float64(len(instances)-1),
+			Severity:  "medium",
+		})
 	}
 
 	return wastes

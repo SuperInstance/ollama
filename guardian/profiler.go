@@ -23,6 +23,7 @@ type Profile struct {
 	TotalRequests     int
 	TotalTokens       int64
 	UtilizationPct    float64 // % of time the model was active vs idle
+	UtilizationIsEst  bool    // true if utilization was estimated (not measured)
 	LoadDuration      time.Duration
 	IdleDuration      time.Duration
 	Samples           int
@@ -30,23 +31,48 @@ type Profile struct {
 
 // ProfileSample is a single measurement point.
 type ProfileSample struct {
-	Timestamp   time.Time
+	Timestamp    time.Time
 	TokensPerSec float64
 	MemoryGB     float64
 	QueueDepth   int
 }
 
-// ModelProfiler collects and computes profiles from fleet state.
-type ModelProfiler struct {
-	samples map[string][]ProfileSample // keyed by "host/model"
-	profiles map[string]*Profile
+// ModelProfilerConfig holds configuration for the profiler.
+type ModelProfilerConfig struct {
+	// EstimatedRequestDuration is the assumed duration per request when actual
+	// durations are unavailable. Defaults to 30s. Mark utilization as estimated
+	// when this fallback is used.
+	EstimatedRequestDuration time.Duration
 }
 
-// NewModelProfiler creates a new profiler.
+// DefaultModelProfilerConfig returns sensible defaults.
+func DefaultModelProfilerConfig() ModelProfilerConfig {
+	return ModelProfilerConfig{
+		EstimatedRequestDuration: 30 * time.Second,
+	}
+}
+
+// ModelProfiler collects and computes profiles from fleet state.
+type ModelProfiler struct {
+	samples  map[string][]ProfileSample // keyed by "host/model"
+	profiles map[string]*Profile
+	config   ModelProfilerConfig
+}
+
+// NewModelProfiler creates a new profiler with default config.
 func NewModelProfiler() *ModelProfiler {
+	return NewModelProfilerWithConfig(DefaultModelProfilerConfig())
+}
+
+// NewModelProfilerWithConfig creates a new profiler with the given config.
+func NewModelProfilerWithConfig(cfg ModelProfilerConfig) *ModelProfiler {
+	if cfg.EstimatedRequestDuration <= 0 {
+		cfg.EstimatedRequestDuration = 30 * time.Second
+	}
 	return &ModelProfiler{
 		samples:  make(map[string][]ProfileSample),
 		profiles: make(map[string]*Profile),
+		config:   cfg,
 	}
 }
 
@@ -79,15 +105,16 @@ func (mp *ModelProfiler) ComputeProfiles(fleet *Fleet) []Profile {
 				p.IdleDuration = time.Since(m.LastRequestAt)
 			}
 
-			// Utilization: fraction of load time that had requests
+			// Utilization: fraction of load time that had requests.
+			// We use the configured estimated request duration as a fallback;
+			// mark the result as estimated so callers know it's not measured.
 			if p.LoadDuration > 0 && p.TotalRequests > 0 {
-				// Estimate active time from request count and average request duration
-				// Assume ~30s per request as baseline
-				activeTime := time.Duration(p.TotalRequests) * 30 * time.Second
+				activeTime := time.Duration(p.TotalRequests) * mp.config.EstimatedRequestDuration
 				if activeTime > p.LoadDuration {
 					activeTime = p.LoadDuration
 				}
 				p.UtilizationPct = float64(activeTime) / float64(p.LoadDuration) * 100
+				p.UtilizationIsEst = true // based on estimate, not actual per-request timing
 			}
 
 			// Process samples if available
@@ -129,9 +156,15 @@ func (mp *ModelProfiler) ComputeProfiles(fleet *Fleet) []Profile {
 	return result
 }
 
-// CollectProfiles is a convenience function that profiles a fleet in one shot.
+// CollectProfiles is a convenience function that profiles a fleet in one shot with defaults.
 func CollectProfiles(fleet *Fleet) []Profile {
 	profiler := NewModelProfiler()
+	return profiler.ComputeProfiles(fleet)
+}
+
+// CollectProfilesWithConfig profiles a fleet with the given config.
+func CollectProfilesWithConfig(fleet *Fleet, cfg ModelProfilerConfig) []Profile {
+	profiler := NewModelProfilerWithConfig(cfg)
 	return profiler.ComputeProfiles(fleet)
 }
 
