@@ -354,3 +354,47 @@ console.log(response.message.content);
 - [Gentoo](https://github.com/gentoo/guru/tree/master/app-misc/ollama)
 - [Flox](https://flox.dev/blog/ollama-part-one)
 - [Guix channel](https://codeberg.org/tusharhero/ollama-guix)
+
+---
+
+## 🏆 SuperInstance Enhancement: Intelligence Monitor
+
+**Are your local models redundant? Find out.**
+
+The Intelligence Monitor is a SuperInstance enhancement for Ollama that analyzes your model usage, detects redundancy, and helps you keep only the models worth keeping.
+
+```bash
+# Install
+pip install -e ./intelligence-monitor/
+
+# Generate a full intelligence report
+ollama-intel report --output html
+
+# Compare two specific models for redundancy
+ollama-intel compare llama3.1:8b mistral:7b
+
+# See your GPU efficiency Pareto frontier
+ollama-intel pareto
+
+# Watch live model activity
+ollama-intel watch
+```
+
+### What it detects
+
+| Feature | Description |
+|---------|-------------|
+| **Jensen-Shannon Divergence** | Output similarity between models. 95%+ similar → redundant. |
+| **Transfer Entropy** | Causal influence — is one model copying another? |
+| **Pareto Frontier** | Maximize model uniqueness while minimizing GPU hours. |
+| **GPU Efficiency** | Quality per watt — are you getting value from your GPU? |
+| **Phase Detection** | Inference vs idle vs mixed workloads. |
+| **Budget Conservation** | GPU hour budgets per model with elimination recommendations. |
+
+```
+Model A and B are 95% similar. You're wasting 4 GPU hours/day.
+```
+
+**Same Ollama. Smarter about which models you keep.**
+
+See [intelligence-monitor/](intelligence-monitor/) for full documentation, integration guide, and Python tests.
