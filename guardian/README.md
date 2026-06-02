@@ -2,127 +2,205 @@
 
 > 3 models loaded, 1 actually used. You're spending 67GB VRAM on ghosts.
 
+**v0.2.0** — Production-grade Ollama fleet monitor with waste detection, alerting, trend analysis, and auto-unload.
+
 ## What It Does
 
-Guardian watches your Ollama fleet and tells you what's wasting resources — models loaded 24/7 that nobody uses, oversized context windows eating VRAM, duplicate quantized variants scattered across instances.
-
-It doesn't guess. It measures.
+Guardian watches your Ollama fleet and tells you when VRAM is being wasted on idle models, oversized contexts, or duplicate variants across instances. It can auto-unload idle models, export metrics to Prometheus, and alert via Slack webhooks.
 
 ## Quick Start
 
 ```bash
-# Generate a conservation report
-go run . report --fleet ./fleet-data/
+# Build
+cd guardian && go build -o guardian .
 
-# Check budgets
-go run . budget --fleet ./fleet-data/ --budget-file budgets.json
+# Report on local fleet
+./guardian -fleet ./fleet_data report
 
-# Continuous monitoring
-go run . watch --fleet ./fleet-data/ --interval 5m
+# Report via live Ollama API
+./guardian -api http://localhost:11434 report
+
+# Continuous watch with alerting
+./guardian -api http://localhost:11434 -alerts alerts.json watch
+
+# Export JSON for dashboards
+./guardian -api http://localhost:11434 -export json -export-file fleet.json report
+
+# Prometheus metrics endpoint
+./guardian -api http://localhost:11434 -prometheus-addr :9090 watch
+
+# Auto-unload idle models
+./guardian -api http://localhost:11434 -auto-unload auto-unload
 ```
 
-## Fleet Data Format
+## Commands
 
-Drop JSON files (one per instance) in a directory:
+| Command | Description |
+|---------|-------------|
+| `report` | Generate a conservation report |
+| `budget` | Check model usage against budget limits |
+| `watch` | Continuously monitor and alert on waste |
+| `export` | Export fleet state (json/prometheus/slack) |
+| `trends` | Analyze utilization trends from saved history |
+| `auto-unload` | Automatically unload idle models |
+
+## Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-fleet` | `.` | Directory with fleet JSON configs |
+| `-api` | | Comma-separated Ollama API base URLs |
+| `-interval` | `5m` | Watch/auto-unload polling interval |
+| `-output` | | Write report to file |
+| `-budget-file` | | JSON file with budget definitions |
+| `-export` | | Export format: `json`, `prometheus`, `slack` |
+| `-export-file` | | Write export to file |
+| `-alerts` | | JSON file with alert rules |
+| `-data-dir` | | Persistence directory for snapshots |
+| `-prometheus-addr` | | Start Prometheus HTTP server on address |
+| `-auto-unload` | `false` | Enable auto-unload of idle models |
+| `-auto-unload-idle` | `1h` | Idle threshold for auto-unload |
+| `-version` | | Print version |
+
+## API Reference
+
+### OllamaClient
+
+Production HTTP client with connection pooling, retries, and timeout management.
+
+```go
+client := NewOllamaClient("http://localhost:11434")
+client.SetTimeout(15 * time.Second)
+client.SetRetries(3, 500*time.Millisecond)
+
+// List all available models
+models, err := client.ListModels(ctx)
+
+// Get running models with VRAM usage
+running, err := client.RunningModels(ctx)
+
+// Unload a specific model
+err := client.UnloadModel(ctx, "llama3:70b")
+```
+
+### ClientPool
+
+Thread-safe pool for managing multiple instances.
+
+```go
+pool := NewClientPool()
+pool.Get("http://gpu1:11434")
+pool.Get("http://gpu2:11434")
+
+fleet, err := FetchFleetFromClients(ctx, pool)
+```
+
+### Persistence
+
+Save and load fleet snapshots and profiling history.
+
+```go
+p, _ := NewPersistence("/var/lib/guardian")
+p.SaveFleetSnapshot(fleet)
+p.SaveProfileSnapshot(profiles)
+
+history, _ := p.LoadFleetHistory(7 * 24 * time.Hour)
+p.CleanupOldSnapshots(30 * 24 * time.Hour)
+```
+
+### Alerting
+
+Configurable alert rules with multiple dispatch channels.
 
 ```json
 {
-  "host": "gpu01",
-  "total_vram_gb": 80,
-  "used_vram_gb": 67,
-  "models": [
+  "rules": [
     {
-      "name": "llama3:70b",
-      "size_gb": 47,
-      "context_length": 32768,
-      "loaded_at": "2024-01-15T08:00:00Z",
-      "last_request_at": "2024-01-15T14:30:00Z",
-      "request_count": 3,
-      "tokens_generated": 1500,
-      "tokens_today": 15000,
-      "concurrent_requests": 0
+      "id": "idle_1hr",
+      "type": "idle_model",
+      "duration": "1h",
+      "message": "Model idle for over 1 hour"
+    },
+    {
+      "id": "vram_90",
+      "type": "vram_threshold",
+      "threshold": 90,
+      "message": "VRAM usage above 90%"
     }
-  ]
+  ],
+  "channels": ["stdout", "file:/var/log/guardian/alerts.log", "webhook:https://hooks.slack.com/..."]
 }
 ```
 
-## Budget Definitions
+### Export Formats
 
-```json
-{
-  "global_max_vram_gb": 200,
-  "default": {
-    "model": "default",
-    "max_vram_gb": 10,
-    "max_concurrent_requests": 5,
-    "max_tokens_per_day": 1000000
-  },
-  "models": [
-    {
-      "model": "llama3:70b",
-      "max_vram_gb": 50,
-      "max_concurrent_requests": 2,
-      "max_tokens_per_day": 500000,
-      "allowed_instances": ["gpu01"]
-    }
-  ]
-}
+```bash
+# JSON output
+./guardian -api http://localhost:11434 -export json report
+
+# Prometheus metrics
+./guardian -api http://localhost:11434 -export prometheus report
+
+# Slack webhook payload
+./guardian -api http://localhost:11434 -export slack report
 ```
 
-## What Gets Detected
+### Trend Analysis
 
-### Idle Models
-Models loaded for hours but barely used. The biggest waste.
-
-```
-Model llama3:70b loaded 24/7 but used 2.1% of the time.
-Switch to on-demand: saves 47GB VRAM.
-```
-
-### Oversized Context Windows
-32K context when you're averaging 500 tokens per conversation. That's ~95% of your context memory wasted.
-
-### Duplicate Variants
-Three different quantizations of the same model loaded across your fleet. Pick one.
-
-## Report Output
-
-```
-╔══════════════════════════════════════════════════════════╗
-║          MODEL CONSERVATION GUARDIAN REPORT             ║
-╚══════════════════════════════════════════════════════════╝
-  Generated: 2024-01-15 14:00:00
-  Fleet: 2 instances, 3 models loaded
-
-── Fleet Overview ──────────────────────────────────────
-  VRAM: 67.0GB / 160.0GB used (42%)
-  Models: 1 active, 2 ghosts (loaded but barely used)
-
-── Waste Detection ─────────────────────────────────────
-  🔴 llama3:70b on gpu01: loaded 6.0h but used 1.5% of the time.
-     Switch to on-demand: saves 47GB VRAM. (recover 47.0GB)
-  🟡 codellama:34b on gpu02: context 32768 but avg ~100 tokens (99% wasted)
-
-── Recommendations ─────────────────────────────────────
-  → Unload llama3:70b on gpu01 when idle >30min (save 47GB)
-  → Reduce codellama:34b context window on gpu02 (save ~6.0GB)
-
-── Summary ─────────────────────────────────────────────
-  3 models loaded, 1 actually used.
-  You're spending 53GB VRAM on ghosts.
+```bash
+# Requires persistence data (-data-dir)
+./guardian -data-dir /var/lib/guardian -api http://localhost:11434 trends
 ```
 
 ## Architecture
 
-| File | Purpose |
-|------|---------|
-| `main.go` | CLI interface (report, budget, watch commands) |
-| `budget.go` | Budget definitions, fleet state, budget enforcement |
-| `profiler.go` | Usage profiling: throughput, memory, queue depth |
-| `detector.go` | Waste detection: idle models, oversized contexts, duplicates |
-| `report.go` | Conservation report generation |
-| `watch.go` | Continuous monitoring loop |
+```
+┌─────────────┐     ┌──────────────┐     ┌───────────────┐
+│  Ollama API  │────▶│  OllamaClient │────▶│  ClientPool   │
+│  /api/tags   │     │  /api/ps      │     │  (per-host)   │
+│  /api/ps     │     │  /api/unload  │     │               │
+└─────────────┘     └──────────────┘     └───────┬───────┘
+                                                  │
+                    ┌─────────────────────────────┤
+                    │                             │
+              ┌─────▼─────┐              ┌────────▼───────┐
+              │  Fleet     │              │  Persistence   │
+              │  Snapshot  │              │  (JSON files)  │
+              └─────┬──────┘              └────────┬───────┘
+                    │                              │
+              ┌─────▼──────┐              ┌────────▼───────┐
+              │  Profiler   │              │  Trend         │
+              │             │              │  Analysis      │
+              └─────┬──────┘              └────────────────┘
+                    │
+         ┌──────────┼──────────┐
+         │          │          │
+    ┌────▼───┐ ┌───▼────┐ ┌──▼──────┐
+    │ Report  │ │ Detector│ │ Budget  │
+    └────┬───┘ └───┬────┘ └──┬──────┘
+         │         │         │
+         └─────────┼─────────┘
+                   │
+            ┌──────▼──────┐
+            │   Export     │
+            │ JSON/Prom/   │
+            │ Slack        │
+            └──────┬──────┘
+                   │
+            ┌──────▼──────┐
+            │  Alerting    │
+            │  Rules/Chans │
+            └─────────────┘
+```
 
-## Why
+## Examples
 
-VRAM is expensive. GPUs sitting at 80% utilization with models nobody's talking to is money on fire. Guardian makes waste visible so you can do something about it.
+See `examples/` for standalone programs:
+
+- **basic_watch.go** — Simple fleet monitoring
+- **auto_unload.go** — Auto-cleanup idle models
+- **prometheus_exporter.go** — Standalone Prometheus metrics endpoint
+
+## License
+
+Same as parent Ollama project.

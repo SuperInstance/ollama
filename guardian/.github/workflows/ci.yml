@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main, guardian]
+    paths:
+      - 'guardian/**'
+  pull_request:
+    branches: [main, guardian]
+    paths:
+      - 'guardian/**'
+
+defaults:
+  run:
+    working-directory: guardian
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: guardian/go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build -o guardian .
+
+      - name: Test
+        run: go test -v -race -count=1 ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: guardian/go.sum
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: guardian
+          args: --timeout=5m
