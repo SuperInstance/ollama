@@ -359,9 +359,22 @@ console.log(response.message.content);
 
 ## 🏆 SuperInstance Enhancement: Intelligence Monitor
 
-**Are your local models redundant? Find out.**
+### The problem
 
-The Intelligence Monitor is a SuperInstance enhancement for Ollama that analyzes your model usage, detects redundancy, and helps you keep only the models worth keeping.
+You downloaded and installed 8 local models this week. Three of them are probably redundant. But which ones?
+
+You could manually run the same prompt through each model and eyeball the results. Or you could let statistics tell you where your GPU hours are going and whether they're paying off.
+
+### What the Intelligence Monitor does
+
+The Intelligence Monitor (`intelligence-monitor/`) is a tool that sits next to Ollama, reads its logs, samples model outputs, and answers one question: *which models should stay, and which are clones costing you GPU time?*
+
+It uses:
+
+- **Jensen-Shannon Divergence** to measure output similarity between any two models
+- **Transfer entropy** to detect whether one model's outputs are influencing another's (meaning one isn't adding original content)
+- **Pareto efficiency** to find the minimal set of models that covers your quality needs at the lowest GPU cost
+- **Workload phase detection** to understand when your GPU is idle vs active
 
 ```bash
 # Install
@@ -370,7 +383,7 @@ pip install -e ./intelligence-monitor/
 # Generate a full intelligence report
 ollama-intel report --output html
 
-# Compare two specific models for redundancy
+# Compare two specific models
 ollama-intel compare llama3.1:8b mistral:7b
 
 # See your GPU efficiency Pareto frontier
@@ -380,21 +393,102 @@ ollama-intel pareto
 ollama-intel watch
 ```
 
-### What it detects
+### Walkthrough: finding your redundant models
 
-| Feature | Description |
-|---------|-------------|
-| **Jensen-Shannon Divergence** | Output similarity between models. 95%+ similar → redundant. |
-| **Transfer Entropy** | Causal influence — is one model copying another? |
-| **Pareto Frontier** | Maximize model uniqueness while minimizing GPU hours. |
-| **GPU Efficiency** | Quality per watt — are you getting value from your GPU? |
-| **Phase Detection** | Inference vs idle vs mixed workloads. |
-| **Budget Conservation** | GPU hour budgets per model with elimination recommendations. |
+Let's say you've been running a handful of models for a few days. The monitor finds eight of them in your logs:
 
 ```
-Model A and B are 95% similar. You're wasting 4 GPU hours/day.
+$ ollama-intel report
+
+🔬 Ollama Intelligence Monitor Report
+============================================================
+
+Models tracked:     8
+Total GPU hours:    12.6
+Tokens generated:   6,735
+Workload phases:    4
+
+📊 Model Usage & Pareto Efficiency
+------------------------------------------------------------
+Model                          GPU h/day    Quality    Pareto
+------------------------------------------------------------
+llama3.1:8b                    1.5          0.512      ✓
+llama3.1:70b                   6.2          0.487
+mistral:7b                     0.9          0.645      ✓
+codellama:34b                  3.1          0.423      ✓
+phi3:3.8b                      0.4          0.211
+...
+
+⚠️  Redundancy Report
+------------------------------------------------------------
+  Model llama3.1:8b and mistral:7b are 96% similar.
+  You're spending 4 GPU hours/day on what amounts to a clone.
+  Transfer entropy analysis: llama3.1:8b's outputs appear to
+  be influencing qwen2:7b (TE=0.284). Qwen isn't adding
+  anything original — drop it.
+
+💡 Budget & Conservation
+------------------------------------------------------------
+  llama3.1:8b: Under budget. Unique model — keep it.
+  mistral:7b: Under budget. Unique model — keep it.
+  codellama:34b: Unique model — keep it.
+  qwen2:7b: Redundant with llama3.1:8b. Eliminate to save.
+  phi3:3.8b: Under budget but redundant with llama3.1:8b-q4.
+             Consider removing.
 ```
 
-**Same Ollama. Smarter about which models you keep.**
+### The ah-ha moment
 
-See [intelligence-monitor/](intelligence-monitor/) for full documentation, integration guide, and Python tests.
+- `llama3.1:8b` and `mistral:7b` have a Jensen-Shannon Divergence of 0.04. That means their outputs are **96% similar**. You're burning GPU cycles on two models that say the same thing.
+
+- **Transfer entropy** shows that `llama3.1:8b`'s outputs are **causing** `qwen2:7b` to produce similar results. The TE score of 0.284 means `qwen2` isn't adding original content — it's echoing. Drop it.
+
+- The **Pareto frontier** identifies three keepers: `llama3.1:8b`, `mistral:7b`, and `codellama:34b`. These three cover the same quality range as all eight models combined at **60% less GPU time**.
+
+### Comparing any two models
+
+You can get a focused breakdown for any pair:
+
+```
+$ ollama-intel compare llama3.1:8b codellama:34b --samples ./samples/
+
+📊 Model Comparison: llama3.1:8b vs codellama:34b
+   JSD (Jensen-Shannon Divergence):  0.3124
+   Output similarity:                68.8%
+   Transfer Entropy A→B:             0.0421
+   Transfer Entropy B→A:             0.0387
+
+✅ Models are sufficiently distinct (only 68.8% similar).
+   Neither influences the other significantly. Keep both.
+```
+
+And for the redundant pair:
+
+```
+$ ollama-intel compare llama3.1:8b qwen2:7b --samples ./samples/
+
+📊 Model Comparison: llama3.1:8b vs qwen2:7b
+   JSD (Jensen-Shannon Divergence):  0.0412
+   Output similarity:                95.9%
+   Transfer Entropy A→B:             0.2841
+   Transfer Entropy B→A:             0.0210
+
+⚠️  WARNING: Models are 96% similar — highly redundant!
+   llama3.1:8b appears to be influencing qwen2:7b.
+   Consider keeping only the smaller/faster model.
+```
+
+### How it works
+
+The monitor connects to three data sources:
+
+| Data source | What it gives you |
+|---|---|
+| Ollama server logs | Model load/unload events, token counts, latency |
+| `ollama ps` | Currently loaded models, memory usage |
+| Output samples (JSON) | Text outputs for JSD and transfer entropy comparison |
+
+No modifications to Ollama's Go code. It reads logs and the API. If those aren't available, it generates synthetic data so you can explore the tool immediately.
+
+See [intelligence-monitor/](intelligence-monitor/) for the full integration guide, API reference, and Python tests.
+

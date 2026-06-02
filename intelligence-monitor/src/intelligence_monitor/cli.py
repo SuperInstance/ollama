@@ -18,6 +18,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -422,8 +423,7 @@ def _demo_samples(records: list[ModelUsageRecord]) -> dict[str, list[OutputSampl
 
 
 def random_gauss(mu: float = 0, sigma: float = 1) -> float:
-    """Gaussian random using Box-Muller."""
-    import random
+    """Gaussian random."""
     return random.gauss(mu, sigma)
 
 
